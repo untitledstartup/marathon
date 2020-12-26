@@ -14,6 +14,7 @@ import com.malinskiy.marathon.android.executor.listeners.ProgressTestRunListener
 import com.malinskiy.marathon.android.executor.listeners.TestRunResultsListener
 import com.malinskiy.marathon.android.executor.listeners.screenshot.ScreenCapturerTestRunListener
 import com.malinskiy.marathon.android.executor.listeners.video.ScreenRecorderTestRunListener
+import com.malinskiy.marathon.android.model.Rotation
 import com.malinskiy.marathon.device.DeviceFeature
 import com.malinskiy.marathon.device.DevicePoolId
 import com.malinskiy.marathon.device.OperatingSystem
@@ -22,6 +23,7 @@ import com.malinskiy.marathon.execution.Configuration
 import com.malinskiy.marathon.execution.TestBatchResults
 import com.malinskiy.marathon.execution.policy.ScreenRecordingPolicy
 import com.malinskiy.marathon.execution.progress.ProgressReporter
+import com.malinskiy.marathon.extension.withTimeoutOrNull
 import com.malinskiy.marathon.io.FileManager
 import com.malinskiy.marathon.log.MarathonLogging
 import com.malinskiy.marathon.report.attachment.AttachmentProvider
@@ -54,6 +56,7 @@ abstract class BaseAndroidDevice(
     override var deviceFeatures: Collection<DeviceFeature> = emptyList()
     override var apiLevel: Int = version.apiLevel
     override var operatingSystem: OperatingSystem = OperatingSystem(version.apiString)
+    override var initialRotation: Rotation = Rotation.ROTATION_0
     var realSerialNumber: String = "Unknown"
     val booted: Boolean
         get() = runBlocking {
@@ -84,6 +87,7 @@ abstract class BaseAndroidDevice(
         operatingSystem = OperatingSystem(version.apiString)
         model = getProperty("ro.product.model") ?: "Unknown"
         manufacturer = getProperty("ro.product.manufacturer") ?: "Unknown"
+        initialRotation = fetchRotation()
 
         externalStorageMount = safeExecuteShellCommand("echo \$EXTERNAL_STORAGE")?.trim {
             when (it) {
@@ -101,9 +105,11 @@ abstract class BaseAndroidDevice(
 
     override suspend fun safePullFile(remoteFilePath: String, localFilePath: String) {
         try {
-            pullFile(remoteFilePath, localFilePath)
+            withTimeoutOrNull(configuration.timeoutConfiguration.pullFile) {
+                pullFile(remoteFilePath, localFilePath)
+            } ?: logger.warn { "Pulling $remoteFilePath timed out. Ignoring" }
         } catch (e: TransferException) {
-            logger.warn { "Pulling $remoteFilePath failed. Ignoring" }
+            logger.warn(e) { "Pulling $remoteFilePath failed. Ignoring" }
         }
     }
 
@@ -111,7 +117,7 @@ abstract class BaseAndroidDevice(
         try {
             pullFolder(remoteFolderPath, localFolderPath)
         } catch (e: TransferException) {
-            logger.warn { "Pulling $remoteFolderPath failed. Ignoring" }
+            logger.warn(e) { "Pulling $remoteFolderPath failed. Ignoring" }
         }
     }
 
@@ -270,6 +276,7 @@ abstract class BaseAndroidDevice(
                     this,
                     screenRecordingPolicy,
                     configuration.screenRecordConfiguration.screenshotConfiguration,
+                    configuration.timeoutConfiguration.screencapturer,
                     this
                 )
                     .also { attachmentProviders.add(it) }
@@ -306,6 +313,24 @@ abstract class BaseAndroidDevice(
         }
         return ""
     }
+
+    private suspend fun fetchRotation() =
+        safeExecuteShellCommand("dumpsys input")?.let { dumpsysOutput ->
+            val start = dumpsysOutput.indexOf("SurfaceOrientation")
+            if (start == -1) {
+                return@let null
+            }
+            val end = dumpsysOutput.indexOf('\n', startIndex = start)
+            if (end == -1) {
+                return@let null
+            }
+
+            val split = dumpsysOutput.substring(start, end).trim().split(":")
+            if (split.size != 2) {
+                return@let null
+            }
+            return@let split[1].trim().toIntOrNull()?.let { Rotation.of(it) }
+        } ?: Rotation.ROTATION_0
 
     override fun toString(): String {
         return "AndroidDevice(model=$model, serial=$serialNumber)"

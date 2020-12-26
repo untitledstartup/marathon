@@ -22,6 +22,7 @@ import com.malinskiy.adam.request.sync.ScreenCaptureRequest
 import com.malinskiy.adam.request.sync.ShellCommandRequest
 import com.malinskiy.adam.request.sync.UninstallRemotePackageRequest
 import com.malinskiy.adam.request.testrunner.TestRunnerRequest
+import com.malinskiy.adam.screencapture.BufferedImageScreenCaptureAdapter
 import com.malinskiy.marathon.analytics.internal.pub.Track
 import com.malinskiy.marathon.android.ADB_SCREEN_RECORD_TIMEOUT_MILLIS
 import com.malinskiy.marathon.android.ADB_SHORT_TIMEOUT_MILLIS
@@ -30,8 +31,8 @@ import com.malinskiy.marathon.android.AndroidConfiguration
 import com.malinskiy.marathon.android.BaseAndroidDevice
 import com.malinskiy.marathon.android.VideoConfiguration
 import com.malinskiy.marathon.android.adam.log.LogCatMessageParser
-import com.malinskiy.marathon.android.adam.screenshot.ImageAdapter
 import com.malinskiy.marathon.android.configuration.SerialStrategy
+import com.malinskiy.marathon.android.exception.CommandRejectedException
 import com.malinskiy.marathon.android.exception.InstallException
 import com.malinskiy.marathon.android.exception.TransferException
 import com.malinskiy.marathon.android.executor.listeners.line.LineListener
@@ -41,6 +42,7 @@ import com.malinskiy.marathon.exceptions.DeviceLostException
 import com.malinskiy.marathon.execution.Configuration
 import com.malinskiy.marathon.execution.TestBatchResults
 import com.malinskiy.marathon.execution.progress.ProgressReporter
+import com.malinskiy.marathon.extension.withTimeoutOrNull
 import com.malinskiy.marathon.test.TestBatch
 import com.malinskiy.marathon.time.Timer
 import kotlinx.coroutines.CancellationException
@@ -49,10 +51,10 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.coroutines.channels.receiveOrNull
 import kotlinx.coroutines.newFixedThreadPoolContext
-import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.supervisorScope
 import java.awt.image.BufferedImage
 import java.io.File
-import java.util.concurrent.TimeUnit
+import java.time.Duration
 import kotlin.coroutines.CoroutineContext
 
 class AdamAndroidDevice(
@@ -65,6 +67,11 @@ class AdamAndroidDevice(
     serialStrategy: SerialStrategy
 ) : BaseAndroidDevice(adbSerial, serialStrategy, configuration, track, timer) {
 
+    /**
+     * This adapter is thread-safe but the internal reusable buffer should be considered if we ever need to make screenshots in parallel
+     */
+    private val imageScreenCaptureAdapter = BufferedImageScreenCaptureAdapter()
+
     override suspend fun setup() {
         super.setup()
 
@@ -74,7 +81,7 @@ class AdamAndroidDevice(
                 modes = listOf(LogcatReadMode.long)
             ), serial = adbSerial, scope = this
         )
-        async(context = coroutineContext) {
+        async {
             val parser = LogCatMessageParser()
 
             while (!logcatChannel.isClosedForReceive) {
@@ -95,8 +102,6 @@ class AdamAndroidDevice(
     private val dispatcher by lazy {
         newFixedThreadPoolContext(1, "AndroidDevice - execution - $adbSerial")
     }
-    private val imageAdapter = ImageAdapter()
-
     private lateinit var logcatChannel: ReceiveChannel<String>
 
     override val coroutineContext: CoroutineContext = dispatcher
@@ -114,13 +119,19 @@ class AdamAndroidDevice(
 
     override suspend fun safeExecuteShellCommand(command: String, errorMessage: String): String? {
         return try {
-            return withTimeoutOrNull(ADB_SHORT_TIMEOUT_MILLIS) {
-                return@withTimeoutOrNull client.execute(ShellCommandRequest(command), serial = adbSerial)
+            withTimeoutOrNull(configuration.timeoutConfiguration.shell) {
+                client.execute(ShellCommandRequest(command), serial = adbSerial)
             }
         } catch (e: Exception) {
             logger.error(errorMessage, e)
             null
         }
+    }
+
+    override suspend fun criticalExecuteShellCommand(command: String, errorMessage: String): String {
+        return withTimeoutOrNull(configuration.timeoutConfiguration.shell) {
+            client.execute(ShellCommandRequest(command), serial = adbSerial)
+        } ?: throw CommandRejectedException(errorMessage)
     }
 
     override suspend fun pullFile(remoteFilePath: String, localFilePath: String) {
@@ -148,8 +159,7 @@ class AdamAndroidDevice(
 
         try {
             val channel = client.execute(PushFileRequest(file, remoteFilePath), serial = adbSerial, scope = this)
-            progress = 0.0
-            while (!channel.isClosedForReceive && progress < 1.0) {
+            while (!channel.isClosedForReceive) {
                 progress = channel.receiveOrNull() ?: break
             }
         } catch (e: PushFailedException) {
@@ -157,7 +167,7 @@ class AdamAndroidDevice(
         }
 
         if (progress != 1.0) {
-            throw TransferException("Couldn't push file $localFilePath to device $serialNumber:$remoteFilePath")
+            throw TransferException("Couldn't push file $localFilePath to device $serialNumber:$remoteFilePath. Last progress: $progress")
         }
 
         if (verify) {
@@ -181,13 +191,15 @@ class AdamAndroidDevice(
             //We have to use a second collection because we're iterating over directoriesToTraverse later
             val currentDepthDirs = mutableListOf<String>()
             for (dir in directoriesToTraverse) {
-                val currentDepthFiles = client.execute(request = ListFilesRequest(dir), serial = adbSerial)
+                withTimeoutOrNull(configuration.timeoutConfiguration.listFiles) {
+                    val currentDepthFiles = client.execute(request = ListFilesRequest(dir), serial = adbSerial)
 
-                filesToPull.addAll(currentDepthFiles.filter { it.type == AndroidFileType.REGULAR_FILE })
-                currentDepthDirs.addAll(
-                    currentDepthFiles.filter { it.type == AndroidFileType.DIRECTORY }
-                        .map { it.directory + '/' + it.name }
-                )
+                    filesToPull.addAll(currentDepthFiles.filter { it.type == AndroidFileType.REGULAR_FILE })
+                    currentDepthDirs.addAll(
+                        currentDepthFiles.filter { it.type == AndroidFileType.DIRECTORY }
+                            .map { it.directory + '/' + it.name }
+                    )
+                } ?: logger.warn { "Listing $dir timed out. Ignoring the rest" }
             }
             directoriesToTraverse = currentDepthDirs
         }
@@ -207,13 +219,18 @@ class AdamAndroidDevice(
                 mkdirs()
             }
             val localFile = File(localFileDirectory, file.name)
+            val remoteFilePath = "${file.directory}${File.separator}${file.name}"
 
-            pullFile("${file.directory}${File.separator}${file.name}", localFile.absolutePath)
+            withTimeoutOrNull(configuration.timeoutConfiguration.pullFile) {
+                pullFile(remoteFilePath, localFile.absolutePath)
+            } ?: logger.warn { "Pulling $remoteFilePath timed out. Ignoring" }
         }
     }
 
     override suspend fun safeUninstallPackage(appPackage: String, keepData: Boolean): String? {
-        return client.execute(UninstallRemotePackageRequest(appPackage, keepData = keepData), serial = adbSerial)
+        return withTimeoutOrNull(configuration.timeoutConfiguration.uninstall) {
+            client.execute(UninstallRemotePackageRequest(appPackage, keepData = keepData), serial = adbSerial)
+        }
     }
 
     override suspend fun installPackage(absolutePath: String, reinstall: Boolean, optionalParams: String): String? {
@@ -221,27 +238,32 @@ class AdamAndroidDevice(
         val remotePath = "/data/local/tmp/${file.name}"
 
         try {
-            pushFile(absolutePath, remotePath, verify = true)
+            withTimeoutOrNull(configuration.timeoutConfiguration.pushFile) {
+                pushFile(absolutePath, remotePath, verify = true)
+            } ?: throw InstallException("Timeout transferring $absolutePath")
         } catch (e: TransferException) {
             throw InstallException(e)
         }
 
-        val result = client.execute(
-            InstallRemotePackageRequest(
-                remotePath,
-                reinstall = reinstall,
-                extraArgs = optionalParams.split(" ").toList() + " "
-            ), serial = adbSerial
-        )
+        withTimeoutOrNull(configuration.timeoutConfiguration.install) {
+            client.execute(
+                InstallRemotePackageRequest(
+                    remotePath,
+                    reinstall = reinstall,
+                    extraArgs = optionalParams.split(" ").toList() + " "
+                ), serial = adbSerial
+            )
+        } ?: throw InstallException("Timeout transferring $absolutePath")
 
         safeExecuteShellCommand("rm $remotePath")
         return result
     }
 
-    override suspend fun getScreenshot(timeout: Long, units: TimeUnit): BufferedImage? {
+    override suspend fun getScreenshot(timeout: Duration): BufferedImage? {
         return try {
-            val rawImage = client.execute(ScreenCaptureRequest(), serial = adbSerial)
-            return imageAdapter.convert(rawImage)
+            withTimeoutOrNull(timeout) {
+                client.execute(ScreenCaptureRequest(imageScreenCaptureAdapter), serial = adbSerial)
+            }
         } catch (e: UnsupportedImageProtocolException) {
             logger.warn(e) { "Unable to retrieve screenshot from device $adbSerial" }
             null
@@ -268,7 +290,7 @@ class AdamAndroidDevice(
     ) {
         val screenRecorderCommand = options.toScreenRecorderCommand(remoteFilePath)
         try {
-            withTimeoutOrNull(ADB_SCREEN_RECORD_TIMEOUT_MILLIS) {
+            withTimeoutOrNull(configuration.timeoutConfiguration.screenrecorder) {
                 val output = client.execute(ShellCommandRequest(screenRecorderCommand), serial = adbSerial)
                 logger.debug { "screenrecord output:\n $output" }
             }
@@ -308,27 +330,24 @@ class AdamAndroidDevice(
         progressReporter: ProgressReporter
     ) {
         try {
-            val deferredResult = async(context = coroutineContext) {
+            supervisorScope {
                 val listener = createExecutionListeners(configuration, devicePoolId, testBatch, deferred, progressReporter)
                 AndroidDeviceTestRunner(this@AdamAndroidDevice).execute(configuration, testBatch, listener)
             }
-
-            deferredResult.await()
         } catch (e: RequestRejectedException) {
+            throw DeviceLostException(e)
+        } catch (e: CommandRejectedException) {
             throw DeviceLostException(e)
         }
     }
 
-    override suspend fun prepare(configuration: Configuration) {
-        val preparationJob = async(coroutineContext) {
-            track.trackDevicePreparing(this@AdamAndroidDevice) {
-                AndroidAppInstaller(configuration).prepareInstallation(this@AdamAndroidDevice)
-                fileManager.removeRemoteDirectory()
-                fileManager.createRemoteDirectory()
-                clearLogcat()
-            }
+    override suspend fun prepare(configuration: Configuration) = supervisorScope {
+        track.trackDevicePreparing(this@AdamAndroidDevice) {
+            AndroidAppInstaller(configuration).prepareInstallation(this@AdamAndroidDevice)
+            fileManager.removeRemoteDirectory()
+            fileManager.createRemoteDirectory()
+            clearLogcat()
         }
-        preparationJob.await()
     }
 
     override fun dispose() {
