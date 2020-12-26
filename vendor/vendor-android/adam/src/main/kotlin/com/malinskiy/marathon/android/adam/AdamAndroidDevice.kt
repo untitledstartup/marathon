@@ -245,7 +245,7 @@ class AdamAndroidDevice(
             throw InstallException(e)
         }
 
-        withTimeoutOrNull(configuration.timeoutConfiguration.install) {
+        val result = withTimeoutOrNull(configuration.timeoutConfiguration.install) {
             client.execute(
                 InstallRemotePackageRequest(
                     remotePath,
@@ -253,7 +253,11 @@ class AdamAndroidDevice(
                     extraArgs = optionalParams.split(" ").toList() + " "
                 ), serial = adbSerial
             )
-        } ?: throw InstallException("Timeout transferring $absolutePath")
+        } 
+        
+        if (result == null) {
+            throw InstallException("Timeout transferring $absolutePath")
+        }
 
         safeExecuteShellCommand("rm $remotePath")
         return result
