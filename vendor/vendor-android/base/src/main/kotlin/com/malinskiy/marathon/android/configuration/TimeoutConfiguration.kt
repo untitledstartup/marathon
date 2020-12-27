@@ -11,5 +11,5 @@ data class TimeoutConfiguration(
     val uninstall: Duration = shell,
     val install: Duration = shell,
     val screenrecorder: Duration = Duration.ofMinutes(10),
-    val screencapturer: Duration = Duration.ofMillis(300),
+    val screencapturer: Duration = Duration.ofSeconds(3),
 )
